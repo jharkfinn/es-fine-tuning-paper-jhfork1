@@ -10,6 +10,8 @@ import signal
 import sys
 import time
 import importlib
+import sysconfig
+from pathlib import Path
 
 import numpy as np
 import ray
@@ -17,11 +19,9 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# We intentionally DO NOT import vLLM or JAX at module scope.
-# They are imported *inside* the Ray actor so the engine can live
-# in its own runtime_env with a fresh libtpu/JAX stack.
+# TPU-only, Option-A: the driver stays free of vLLM/JAX/libtpu.
+# vLLM and JAX are imported *inside* the Ray actor envs.
 
-# ----------------------------- CLI ------------------------------------------
 SIGMA = 0.001
 ALPHA = 0.0005
 POPULATION_SIZE = 30
@@ -43,55 +43,96 @@ def parse_args():
                    help="Comma-separated TPU chip ids per engine, e.g. '0,1,2,3'")
     # Per-actor pip pins (override defaults if needed)
     p.add_argument("--engine_vllm", type=str, default="vllm==0.11.0")
-    p.add_argument("--engine_jax_tpu", type=str, default="jax[tpu]==0.7.2")  # Automatically installs jaxlib and libtpu
+    p.add_argument("--engine_jax", type=str, default="jax==0.7.2")
+    p.add_argument("--engine_jaxlib", type=str, default="jaxlib==0.7.2")
+    p.add_argument("--engine_libtpu", type=str, default="libtpu==0.0.27")    # fresh (Oct 22, 2025) for Pallas
     p.add_argument("--engine_torch", type=str, default="torch==2.8.0")
     p.add_argument("--engine_transformers", type=str, default="transformers>=4.30.0")
     p.add_argument("--engine_numpy", type=str, default="numpy>=1.21.0")
+    # Optional: toggle risky age-check bypass inside sitecustomize
+    p.add_argument("--disable_libtpu_age_check", action="store_true",
+                   help="Set to bypass JAX Pallas libtpu 'freshness' check via sitecustomize (use only if necessary).")
     return p.parse_args()
 
-# ------------------------- Countdown task reward ----------------------------
-# We import the reward function lazily to keep this file self-contained if desired.
 def _load_reward():
-    try:
-        from countdown.countdown_task import reward_function
-        return reward_function
-    except Exception as e:
-        raise RuntimeError("Could not import countdown.reward_function. Ensure countdown/ is on PYTHONPATH.") from e
-
-# ----------------------------- Actor ----------------------------------------
-# We define an actor class that imports vLLM *inside* the actor process.
-# That way, the driver does not need vLLM/JAX/libtpu installed at all.
+    from countdown.countdown_task import reward_function
+    return reward_function
 
 @ray.remote
 class TpuEngineActor:
-    def __init__(self, model_dir: str, dtype: str = "bfloat16"):
-        # The driver has provisioned a per-actor pip env via runtime_env.pip.
-        # Apply JAX Pallas compat patches BEFORE importing vLLM.
+    def __init__(self, model_dir: str, dtype: str = "bfloat16", disable_age_check: bool = False):
+        # 1) Install sitecustomize.py into this actor's venv site-packages so every
+        #    child Python (internal workers) gets the same patches at startup.
+        self._install_sitecustomize_for_children(disable_age_check=disable_age_check)
+        # 2) Apply patches in *this* process too (order matters: do this BEFORE importing vLLM/JAX).
         self._apply_jax_pallas_memoryspace_compat()
-        self._disable_libtpu_age_check()
+        if disable_age_check:
+            self._disable_libtpu_age_check_now()
 
-        # Import vLLM now that JAX is patched
+        # Import vLLM only after patching.
         from vllm import LLM, SamplingParams  # noqa: WPS433
 
-        # Optional envs to keep vLLM stable in actors
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         os.environ.setdefault("VLLM_DEVICE", "tpu")
 
-        # Instantiate the engine
         self._SamplingParams = SamplingParams
         self._llm = LLM(
             model=model_dir,
-            tensor_parallel_size=1,          # one chip per actor
+            tensor_parallel_size=1,
             distributed_executor_backend="ray",
             dtype=dtype,
             enable_prefix_caching=False,
             enforce_eager=False,
         )
-
-        # Discover params accessors for ES ops (V1 then V0)
         self._named_params_iter = self._resolve_param_accessor()
 
-    # -------------------- internal: pallas compat shim --------------------
+    # ---- Robust patch propagation ---------------------------------------
+    @staticmethod
+    def _install_sitecustomize_for_children(disable_age_check: bool):
+        # Write a sitecustomize.py into the actor venv's site-packages.
+        purelib = sysconfig.get_paths().get("purelib")
+        if not purelib:
+            return
+        os.makedirs(purelib, exist_ok=True)
+        target = os.path.join(purelib, "sitecustomize.py")
+        content = '''"""Patch JAX Pallas compatibility for all child processes (vLLM workers)."""
+import os
+import sys
+
+def apply_jax_pallas_compat():
+    """Apply JAX Pallas MemorySpace compatibility fix."""
+    try:
+        import importlib
+        pltpu = importlib.import_module("jax.experimental.pallas.tpu")
+        ms = getattr(pltpu, "MemorySpace", None)
+        for alias in ("TPUMemorySpace", "TpuMemorySpace"):
+            if ms is not None and not hasattr(pltpu, alias):
+                setattr(pltpu, alias, ms)
+    except Exception:
+        pass
+
+def disable_libtpu_age_check():
+    """Bypass JAX Pallas libtpu age check (opt-in via env var)."""
+    if os.environ.get("VLLM_TPU_DISABLE_LIBTPU_AGE_CHECK") != "1":
+        return
+    try:
+        import importlib
+        cloud_tpu_init = importlib.import_module("jax._src.cloud_tpu_init")
+        def patched_is_cloud_tpu_older_than(*args, **kwargs):
+            return False
+        setattr(cloud_tpu_init, "is_cloud_tpu_older_than", patched_is_cloud_tpu_older_than)
+    except Exception:
+        pass
+
+# Apply patches at interpreter startup for ALL processes (including vLLM workers)
+apply_jax_pallas_compat()
+disable_libtpu_age_check()
+'''
+        with open(target, "w") as f:
+            f.write(content)
+        if disable_age_check:
+            os.environ["VLLM_TPU_DISABLE_LIBTPU_AGE_CHECK"] = "1"
+
     @staticmethod
     def _apply_jax_pallas_memoryspace_compat():
         try:
@@ -101,58 +142,38 @@ class TpuEngineActor:
                 if ms is not None and not hasattr(pltpu, alias):
                     setattr(pltpu, alias, ms)
         except Exception:
-            # Best-effort; some builds don't ship pallas.tpu
             pass
 
     @staticmethod
-    def _disable_libtpu_age_check():
-        """Monkey-patch JAX Pallas to bypass libtpu age check.
-
-        The check requires libtpu < 1 month old, but no such version exists publicly.
-        This approach patches BEFORE any JAX module loads the function.
-        """
-        import sys
+    def _disable_libtpu_age_check_now():
         try:
-            # Create patched function BEFORE any imports
+            cloud_tpu_init = importlib.import_module("jax._src.cloud_tpu_init")
             def patched_is_cloud_tpu_older_than(*args, **kwargs):
                 return False
-
-            # Patch cloud_tpu_init module
-            cloud_tpu_init = importlib.import_module("jax._src.cloud_tpu_init")
             setattr(cloud_tpu_init, "is_cloud_tpu_older_than", patched_is_cloud_tpu_older_than)
-
-            # Ensure lowering module is NOT loaded yet, or reload it
             if "jax._src.pallas.mosaic.lowering" in sys.modules:
-                # Module already loaded with old function, need to reload
                 import importlib as imp_reload
-                lowering = sys.modules["jax._src.pallas.mosaic.lowering"]
-                imp_reload.reload(lowering)
+                imp_reload.reload(sys.modules["jax._src.pallas.mosaic.lowering"])
+        except Exception:
+            pass
 
-            print("Successfully patched JAX Pallas libtpu age check")
-        except Exception as e:
-            # If patching fails, log but continue (will fail later at Pallas compilation)
-            print(f"Warning: Failed to patch libtpu age check: {e}")
-
-    # -------------------- internal: params accessor -----------------------
+    # ---- Param accessor --------------------------------------------------
     def _resolve_param_accessor(self):
-        # vLLM V1 path
         if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "engine_core"):
             model_executor = self._llm.llm_engine.engine_core.model_executor
             if hasattr(model_executor, "driver_worker"):
                 return model_executor.driver_worker.model_runner.model.named_parameters
-        # vLLM V0 path
         if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "model_executor"):
             model_executor = self._llm.llm_engine.model_executor
             if hasattr(model_executor, "driver_worker"):
                 return model_executor.driver_worker.model_runner.model.named_parameters
         raise RuntimeError("Could not locate model parameters in vLLM engine")
 
-    # -------------------------- Inference ---------------------------------
+    # ---- Inference & ES ops ---------------------------------------------
     def generate(self, prompts, temperature: float = 0.0, seed: int = 42, max_tokens: int = 1024):
         sampling_params = self._SamplingParams(temperature=temperature, seed=seed, max_tokens=max_tokens)
         return self._llm.generate(prompts, sampling_params, use_tqdm=False)
 
-    # -------------------------- ES ops ------------------------------------
     def perturb_self_weights(self, seed: int, sigma_or_scale: float, negate: bool = False):
         scale = float(sigma_or_scale)
         sign = -1.0 if negate else 1.0
@@ -189,7 +210,7 @@ class TpuEngineActor:
 
 # -------------------- TPU launcher with isolated actor env ------------------
 def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | None,
-                       pip_versions: dict[str, str]):
+                       pip_versions: dict[str, str], disable_age_check: bool):
     # Parse chip list; default 0..N-1
     if not tpu_chips_csv or tpu_chips_csv.strip() == "":
         chips = [str(i) for i in range(max(1, num_engines))]
@@ -200,12 +221,15 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
 
     pip_list = [
         pip_versions["engine_vllm"],
-        pip_versions["engine_jax_tpu"],         # jax[tpu] installs jax, jaxlib, and libtpu
-        pip_versions["engine_torch"],           # CPU-only torch is fine
+        pip_versions["engine_jax"],
+        pip_versions["engine_jaxlib"],
+        pip_versions["engine_libtpu"],          # fresh (Oct 22, 2025) - satisfies Pallas age check
+        pip_versions["engine_torch"],
         pip_versions["engine_transformers"],
         pip_versions["engine_numpy"],
         "tensorboard>=2.20.0",
         "psutil>=5.8.0",
+        "virtualenv>=20.0.0",
     ]
 
     engines = []
@@ -217,17 +241,18 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
                 "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
                 "VLLM_DEVICE": "tpu",
                 "HF_HUB_DISABLE_TELEMETRY": "1",
+                # Optional opt-in for risky bypass:
+                "VLLM_TPU_DISABLE_LIBTPU_AGE_CHECK": "1" if disable_age_check else "0",
             },
             "pip": pip_list,
         }
         actor = TpuEngineActor.options(num_cpus=0, scheduling_strategy="DEFAULT",
                                        runtime_env=runtime_env).remote(
-            model_dir=model_dir, dtype="bfloat16"
+            model_dir=model_dir, dtype="bfloat16", disable_age_check=disable_age_check
         )
         engines.append(actor)
     return engines
 
-# ------------------------- Evaluation helpers -------------------------------
 def evaluate_countdown_handle(actor, task_datas):
     prompts = [d["context"] for d in task_datas]
     return actor.generate.remote(prompts, temperature=0.0, seed=42, max_tokens=1024), time.time()
@@ -241,17 +266,13 @@ def _postprocess_outputs(outputs, task_datas, reward_fn):
         avg_rewards.append(r["reward"])
     return {"rewards": rewards, "avg_reward": float(np.mean(avg_rewards)) if avg_rewards else 0.0}
 
-# --------------------------------- Main -------------------------------------
 def main(args):
-    # No GPU/torch_xla support in this script by design.
-    # Driver env should not import JAX/vLLM—engines handle that in their own env.
-
+    # Driver stays JAX/vLLM-free.
     if args.global_seed is not None:
         random.seed(args.global_seed)
         np.random.seed(args.global_seed)
         torch.manual_seed(args.global_seed)
 
-    # Ray local
     os.environ.pop("RAY_ADDRESS", None)
     os.environ.pop("RAY_HEAD_IP", None)
     os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
@@ -259,11 +280,10 @@ def main(args):
 
     reward_fn = _load_reward()
 
-    # Logging
     logging_dir = f"{args.experiment_dir}/countdown_tpu_isolated_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(log_dir=logging_dir)
 
-    # Prepare HF checkpoint for vLLM to load
+    # Prepare base HF checkpoint for vLLM to load (bf16)
     model_saves_dir = f"{logging_dir}/model_saves"
     os.makedirs(model_saves_dir, exist_ok=True)
 
@@ -288,28 +308,27 @@ def main(args):
     # Launch TPU engines with per-actor pip env (fresh libtpu/JAX/vLLM)
     pip_versions = {
         "engine_vllm": args.engine_vllm,
-        "engine_jax_tpu": args.engine_jax_tpu,
+        "engine_jax": args.engine_jax,
+        "engine_jaxlib": args.engine_jaxlib,
+        "engine_libtpu": args.engine_libtpu,
         "engine_torch": args.engine_torch,
         "engine_transformers": args.engine_transformers,
         "engine_numpy": args.engine_numpy,
     }
-    engines = launch_tpu_engines(args.num_engines, base_model_path, args.tpu_chips, pip_versions)
+    engines = launch_tpu_engines(args.num_engines, base_model_path, args.tpu_chips, pip_versions, args.disable_libtpu_age_check)
 
     # ES loop
     for i in range(args.num_iterations):
         print(f"\n=== Generation {i} ===")
         t0 = time.time()
 
-        # Seeds for population
         seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
         seeds_perf = {}
 
-        # Round-robin scheduling across engines
         seed_iter = iter(seeds)
         inflight = {}
         results_this_gen = []
 
-        # Kick off one eval per engine
         for eng_idx, actor in enumerate(engines):
             try:
                 seed = next(seed_iter)
@@ -343,7 +362,6 @@ def main(args):
             inflight[handle] = {"actor": actor, "eng_idx": meta["eng_idx"], "seed": next_seed, "start_ts": st}
             print(f"Scheduled seed {next_seed} on engine {meta['eng_idx']}")
 
-        # Normalize
         all_avg = [v["avg_reward"] for v in seeds_perf.values()]
         mean_r = float(np.mean(all_avg)) if all_avg else 0.0
         std_r = float(np.std(all_avg)) if all_avg else 0.0
@@ -374,17 +392,14 @@ def main(args):
         ray.get([e.load_state_dict.remote(cpu_state) for e in engines])
         writer.add_scalar("time/broadcast", time.time() - t2, i)
 
-        # Log per-result timing
         for idx, res in enumerate(results_this_gen):
             print(f"IDX:{idx} Seed {res['seed']} avg_reward:{res['avg_reward']:.4f} time:{res['time']:.3f}s")
         writer.add_scalar("time/iteration", time.time() - t0, i)
 
-    # Save final weights
     final_dir = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
     os.makedirs(final_dir, exist_ok=True)
     ray.get(engines[0].save_self_weights_to_disk.remote(f"{final_dir}/pytorch_model.pth"))
     print(f"Final model weights saved to {final_dir}.")
-
     ray.shutdown()
 
 if __name__ == "__main__":
