@@ -402,24 +402,69 @@ python es_fine-tuning_countdown_accl_tpu_vllm_isolated_env.py \
 - **Driver deps**: `requirements-driver.txt`
 - **Engine deps**: `requirements-engine.txt` (reference only)
 
-### Status
+### Status (v1 - Partial Resolution)
 
-✅ **Dependency deadlock RESOLVED**
 ✅ **libtpu 0.0.23 works with Pallas** (no "too old" error)
-✅ **No torch_xla anywhere** (no PJRT API mismatch)
-✅ **No manual site-packages patching** (shim applied per-actor)
-✅ **Same ES algorithm** (unchanged from verified version)
+✅ **Isolated actor environments working** (no global contamination)
+✅ **sitecustomize.py patches applied** (shim in virtualenv)
+❌ **torch_xla still required by vLLM** (cannot be removed)
+❌ **PJRT API mismatch with libtpu 0.0.27** (torch_xla 2.8.1 incompatible)
 
 ---
 
-## Next Steps (Historical - Now Resolved)
+## v2 Investigation (2025-10-27)
 
-~~1. Monitor vLLM repository for compatibility updates~~
-~~2. Test with alternative vLLM versions~~
-~~3. Consider fallback to CPU/GPU inference for development~~
-~~4. Report issue to vLLM maintainers with detailed version info~~
+### Updated Script and Requirements
 
-**UPDATE**: All issues resolved via isolated actor environments. No action needed.
+**Files:**
+- `es_fine-tuning_countdown_accl_tpu_vllm_isolated_env_v2.py`
+- `requirements-driver-v2.txt`
+- `requirements-engine-v2.txt`
+
+**Key Changes:**
+1. Fixed sitecustomize.py template to install in actor virtualenvs
+2. Changed from jax[tpu] to explicit jax==0.7.2 + jaxlib==0.7.2 + libtpu==0.0.27
+3. Added CLI args for overriding engine dependency versions
+4. Added --disable_libtpu_age_check flag
+
+### Critical Discovery: vLLM Requires torch_xla
+
+**Test:** Removed torch_xla from global environment, tested v2 script with libtpu 0.0.27
+
+**Result:** `ModuleNotFoundError: No module named 'torch_xla'`
+
+**Location:** `/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/pallas.py:37`
+
+**Code:** `import torch_xla.core.xla_builder as xb`
+
+**Conclusion:** vLLM 0.11.0's Pallas attention backend directly imports torch_xla, making it a hard requirement for TPU inference.
+
+### Fundamental Dependency Deadlock (UNRESOLVED)
+
+The dependency chain creates an unbreakable cycle:
+
+```
+vLLM TPU → Pallas backend → torch_xla.core.xla_builder (required)
+torch_xla 2.8.1 → libtpu with PJRT API size 24 (only 0.0.17)
+JAX Pallas → libtpu < 1 month old (requires 0.0.27+)
+libtpu 0.0.27 → PJRT API size 32 (incompatible with torch_xla 2.8.1)
+```
+
+**No version combination satisfies all requirements simultaneously.**
+
+### Possible Solutions (Not Currently Available)
+
+1. **Wait for torch_xla update** supporting libtpu 0.0.27's PJRT API (size 32)
+2. **vLLM update** to remove torch_xla dependency (use JAX-only TPU backend)
+3. **JAX Pallas** relaxes libtpu age requirement
+4. **Compatible libtpu** release that satisfies both Pallas age check and torch_xla PJRT API
+
+### Next Steps
+
+1. Monitor for torch_xla updates compatible with newer libtpu
+2. Test vLLM with alternative backends if/when available
+3. Consider pure JAX implementation for inference (removes vLLM/torch_xla entirely)
+4. Continue ES development on CPU/GPU until TPU compatibility is resolved
 
 ---
 
@@ -432,6 +477,6 @@ python es_fine-tuning_countdown_accl_tpu_vllm_isolated_env.py \
 
 ---
 
-**Last Updated:** 2025-10-26
+**Last Updated:** 2025-10-27
 **Environment:** TPU v6 lite on Cloud TPU
-**Status:** ✅ **WORKING** - Dependency deadlock resolved via isolated actor environments
+**Status:** ❌ **BLOCKED** - vLLM 0.11.0 requires torch_xla, which is incompatible with libtpu versions fresh enough for JAX Pallas
