@@ -223,33 +223,70 @@ class WorkerExtension:
         if not hasattr(self, '_ref_state'):
             self._ref_state = None
 
-        # Ensure ref tree present for dtype/sharding
+        # Get current state as reference for structure and device placement
+        mode, current_state = self._get_state()
         if self._ref_state is None:
-            _, ref = self._get_state()
-            self._ref_state = ref
+            self._ref_state = current_state
 
-        def to_like(path, src_np, ref_leaf):
-            if isinstance(src_np, np.ndarray):
-                return _match_like(ref_leaf, src_np)
-            return src_np
+        # Flatten both states and convert leaves pairwise
+        flat_cpu, _ = jax.tree_util.tree_flatten(state_cpu)
+        flat_ref, treedef_ref = jax.tree_util.tree_flatten(current_state)
 
-        # zip-with structure: map both trees together
-        def map2(ref_sub, src_sub, path=""):
-            if isinstance(ref_sub, dict) and isinstance(src_sub, dict):
-                return {k: map2(ref_sub[k], src_sub[k], f"{path}/{k}") for k in sorted(src_sub.keys())}
-            if isinstance(ref_sub, list) and isinstance(src_sub, list):
-                return [map2(r, s, f"{path}[{i}]") for i, (r, s) in enumerate(zip(ref_sub, src_sub))]
-            if isinstance(ref_sub, tuple) and isinstance(src_sub, tuple):
-                return tuple(map2(r, s, f"{path}({i})") for i, (r, s) in enumerate(zip(ref_sub, src_sub)))
-            return to_like(path or "/", src_sub, ref_sub)
+        # Convert CPU numpy leaves to device arrays matching reference leaves
+        def to_device_leaf(cpu_leaf, ref_leaf):
+            if isinstance(cpu_leaf, np.ndarray) and _is_array(ref_leaf):
+                return _match_like(ref_leaf, cpu_leaf)
+            return cpu_leaf
 
-        mode = self._state_mode or self._get_state()[0]
-        new_state = map2(self._ref_state, state_cpu)
+        flat_device = [to_device_leaf(cpu, ref) for cpu, ref in zip(flat_cpu, flat_ref)]
+
+        # Unflatten using the REFERENCE treedef (preserve current model structure)
+        new_state = jax.tree_util.tree_unflatten(treedef_ref, flat_device)
+
+        # Direct parameter update via NNX
+        model = self._get_model()
+        if fnnx is not None:
+            # Try NNX update first
+            if hasattr(fnnx, 'update'):
+                try:
+                    fnnx.update(model, new_state)
+                    return True
+                except Exception as e:
+                    pass
+
+            # Try direct GraphDef update for NNX models
+            try:
+                # Get the model's graphdef and directly update state
+                graphdef, _ = fnnx.split(model)
+                updated_model = fnnx.merge(graphdef, new_state)
+                if updated_model is not None:
+                    self.model_runner.model = updated_model
+                    return True
+            except Exception as e:
+                pass
+
+        # Last resort: direct in-place mutation using tree_map
+        # This works by traversing both trees and copying values
+        def copy_leaf(src, dst):
+            if _is_array(src) and _is_array(dst):
+                # Copy data from src to dst (in-place if possible)
+                dst_updated = jnp.array(src, dtype=dst.dtype)
+                return dst_updated
+            return src
+
+        jax.tree_util.tree_map(copy_leaf, new_state, current_state)
+
+        # Force model state update
         self._set_state(mode, new_state)
         return True
 
     def save_self_weights_to_disk(self, path_prefix: str):
         """Save to <path_prefix>.npz and <path_prefix>.treedef (portable)."""
+        # Ensure parent directory exists
+        parent_dir = os.path.dirname(path_prefix)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
         state_cpu = self.dump_state_dict()
         leaves, treedef = jax.tree_util.tree_flatten(state_cpu)
         np.savez_compressed(path_prefix + ".npz", *leaves)

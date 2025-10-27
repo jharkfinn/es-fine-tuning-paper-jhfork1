@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Experiment outputs
+es-ft-experiment/
+*.txt
+!requirements.txt
+
+# Model checkpoints
+*.safetensors
+*.bin
+*.ckpt
+*.pt
+*.pth
+
+# Logs
+*.log
+events.out.tfevents.*
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -83,7 +83,16 @@ class VllmTpuActor:
     # Inference
     def generate(self, prompts, temperature: float = 0.0, seed: int = 42, max_tokens: int = 1024):
         params = self._SamplingParams(temperature=temperature, seed=seed, max_tokens=max_tokens)
-        return self._llm.generate(prompts, params, use_tqdm=False)
+        outputs = self._llm.generate(prompts, params, use_tqdm=False)
+        # Convert vLLM outputs to serializable dictionaries
+        return [
+            {
+                "prompt": output.prompt,
+                "outputs": [{"text": o.text, "token_ids": o.token_ids} for o in output.outputs],
+                "finished": output.finished,
+            }
+            for output in outputs
+        ]
 
     # ES ops - run inside vLLM worker via collective_rpc
     def perturb_self_weights(self, seed: int, sigma_or_scale: float, negate: bool = False):
@@ -152,7 +161,7 @@ def evaluate_countdown_handle(actor, task_datas):
 def _postprocess_outputs(outputs, task_datas, reward_fn):
     rewards, avg_rewards = [], []
     for output, data in zip(outputs, task_datas):
-        response = output.outputs[0].text
+        response = output["outputs"][0]["text"]  # Access dictionary instead of object
         r = reward_fn(response, data["numbers"], data["target"])
         rewards.append(r)
         avg_rewards.append(r["reward"])
