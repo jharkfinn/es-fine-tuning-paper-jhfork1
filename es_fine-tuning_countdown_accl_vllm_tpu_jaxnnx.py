@@ -103,6 +103,10 @@ class VllmTpuActor:
     def save_self_weights_to_disk(self, path: str):
         return self._llm.collective_rpc("save_self_weights_to_disk", args=(path,))
 
+    def collective_rpc(self, method: str, args: tuple = (), kwargs: dict = None):
+        kwargs = kwargs or {}
+        return self._llm.collective_rpc(method, args=args, kwargs=kwargs)
+
 # -------------------- TPU launcher with isolated actor env ------------------
 def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | None, pip_versions: dict):
     if not tpu_chips_csv or tpu_chips_csv.strip() == "":
@@ -295,6 +299,19 @@ def main(args):
         for idx, res in enumerate(results_this_gen):
             print(f"IDX:{idx} Seed {res['seed']} avg_reward:{res['avg_reward']:.4f} time:{res['time']:.3f}s")
         writer.add_scalar("time/iteration", time.time() - t0, i)
+
+        # Log TPU utilization stats
+        try:
+            tpu_stats = ray.get(engines[0].collective_rpc.remote("get_tpu_stats", args=()))
+            if tpu_stats and isinstance(tpu_stats, list) and len(tpu_stats) > 0:
+                stats = tpu_stats[0]
+                print(f"TPU Stats: {stats}")
+                if 'memory' in stats:
+                    writer.add_scalar("tpu/memory_allocated_gb", stats['memory'].get('bytes_in_use', 0) / 1e9, i)
+                if 'xla_memory' in stats:
+                    writer.add_scalar("tpu/xla_memory_gb", stats['xla_memory'].get('bytes_in_use', 0) / 1e9, i)
+        except Exception as e:
+            print(f"Could not fetch TPU stats: {e}")
 
     final_dir = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
     os.makedirs(final_dir, exist_ok=True)

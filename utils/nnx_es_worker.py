@@ -256,3 +256,23 @@ class WorkerExtension:
         with open(path_prefix + ".treedef", "wb") as f:
             f.write(treedef.to_pickle())  # type: ignore[attr-defined]
         return True
+
+    def get_tpu_stats(self):
+        """Get TPU compute and memory utilization statistics."""
+        stats = {}
+        try:
+            # Get memory stats from JAX devices
+            devices = jax.devices()
+            if devices:
+                device = devices[0]
+                if hasattr(device, 'memory_stats'):
+                    mem_stats = device.memory_stats()
+                    stats['memory'] = mem_stats
+                # Try to get device utilization info
+                if hasattr(jax.lib, 'xla_client'):
+                    xla_client = jax.lib.xla_client
+                    if hasattr(xla_client, 'get_device_memory_stats'):
+                        stats['xla_memory'] = xla_client.get_device_memory_stats(device)
+        except Exception as e:
+            stats['error'] = str(e)
+        return stats
