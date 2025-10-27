@@ -1,6 +1,6 @@
-# Engine (actor) environment for TPU v6e
-# Fresh libtpu is critical for JAX Pallas; 0.0.27 was released Oct 22, 2025.
-# NOTE: Use explicit jax/jaxlib/libtpu versions (NOT jax[tpu]) to avoid pip conflicts
+# Engine (actor) environment for TPU v6e with tpu-inference backend
+# Fresh libtpu (0.0.27, Oct 22 2025) + JAX, NO torch_xla
+# This configuration attempts to use vLLM's unified TPU backend
 vllm==0.11.0
 jax==0.7.2
 jaxlib==0.7.2
@@ -10,4 +10,4 @@ transformers>=4.30.0
 numpy>=1.21.0
 tensorboard>=2.20.0
 psutil>=5.8.0
-# NO torch_xla in the engine env.
+# NO torch_xla - relying on JAX-only TPU path

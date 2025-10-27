@@ -238,6 +238,7 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
         runtime_env = {
             "env_vars": {
                 "TPU_VISIBLE_CHIPS": chip_id,
+                "PJRT_DEVICE": "TPU",                        # Required for unified TPU backend
                 "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
                 "VLLM_DEVICE": "tpu",
                 "HF_HUB_DISABLE_TELEMETRY": "1",
