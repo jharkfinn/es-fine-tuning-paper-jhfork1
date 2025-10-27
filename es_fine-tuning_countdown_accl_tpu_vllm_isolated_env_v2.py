@@ -41,17 +41,8 @@ def parse_args():
     p.add_argument("--global_seed", type=int, default=None)
     p.add_argument("--tpu_chips", type=str, default=None,
                    help="Comma-separated TPU chip ids per engine, e.g. '0,1,2,3'")
-    # Per-actor pip pins (override defaults if needed)
-    p.add_argument("--engine_vllm", type=str, default="vllm==0.11.0")
-    p.add_argument("--engine_jax", type=str, default="jax==0.7.2")
-    p.add_argument("--engine_jaxlib", type=str, default="jaxlib==0.7.2")
-    p.add_argument("--engine_libtpu", type=str, default="libtpu==0.0.27")    # fresh (Oct 22, 2025) for Pallas
-    p.add_argument("--engine_torch", type=str, default="torch==2.8.0")
-    p.add_argument("--engine_transformers", type=str, default="transformers>=4.30.0")
-    p.add_argument("--engine_numpy", type=str, default="numpy>=1.21.0")
-    # Optional: toggle risky age-check bypass inside sitecustomize
-    p.add_argument("--disable_libtpu_age_check", action="store_true",
-                   help="Set to bypass JAX Pallas libtpu 'freshness' check via sitecustomize (use only if necessary).")
+    # vllm-tpu bundles all required dependencies (jax, jaxlib, libtpu, torch)
+    # No need for individual version pins
     return p.parse_args()
 
 def _load_reward():
@@ -159,14 +150,56 @@ disable_libtpu_age_check()
 
     # ---- Param accessor --------------------------------------------------
     def _resolve_param_accessor(self):
-        if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "engine_core"):
-            model_executor = self._llm.llm_engine.engine_core.model_executor
-            if hasattr(model_executor, "driver_worker"):
-                return model_executor.driver_worker.model_runner.model.named_parameters
-        if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "model_executor"):
-            model_executor = self._llm.llm_engine.model_executor
-            if hasattr(model_executor, "driver_worker"):
-                return model_executor.driver_worker.model_runner.model.named_parameters
+        # Wrap all attribute access in try-except to handle different vLLM backends
+        try:
+            # Try V1 engine (PyTorch)
+            if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "engine_core"):
+                model_executor = self._llm.llm_engine.engine_core.model_executor
+                if hasattr(model_executor, "driver_worker"):
+                    return model_executor.driver_worker.model_runner.model.named_parameters
+        except (AttributeError, TypeError):
+            pass
+
+        try:
+            # Try V0 engine (PyTorch)
+            if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "model_executor"):
+                model_executor = self._llm.llm_engine.model_executor
+                if hasattr(model_executor, "driver_worker"):
+                    return model_executor.driver_worker.model_runner.model.named_parameters
+        except (AttributeError, TypeError):
+            pass
+
+        try:
+            # Try JAX backend (vllm-tpu) - V1 with worker
+            if hasattr(self._llm, "llm_engine") and hasattr(self._llm.llm_engine, "engine_core"):
+                engine_core = self._llm.llm_engine.engine_core
+                if hasattr(engine_core, "worker"):
+                    worker = engine_core.worker
+                    if hasattr(worker, "model_runner") and hasattr(worker.model_runner, "model"):
+                        model = worker.model_runner.model
+                        if hasattr(model, "named_parameters"):
+                            return model.named_parameters
+        except (AttributeError, TypeError):
+            pass
+
+        try:
+            # Try direct model access for JAX NNX models
+            if hasattr(self._llm, "llm_engine"):
+                engine = self._llm.llm_engine
+                # Check for worker attribute variations
+                for worker_attr in ['worker', 'model_executor', 'executor']:
+                    try:
+                        if hasattr(engine, worker_attr):
+                            worker = getattr(engine, worker_attr)
+                            if hasattr(worker, 'model_runner') and hasattr(worker.model_runner, 'model'):
+                                model = worker.model_runner.model
+                                if hasattr(model, 'named_parameters'):
+                                    return model.named_parameters
+                    except (AttributeError, TypeError):
+                        continue
+        except (AttributeError, TypeError):
+            pass
+
         raise RuntimeError("Could not locate model parameters in vLLM engine")
 
     # ---- Inference & ES ops ---------------------------------------------
@@ -209,8 +242,7 @@ disable_libtpu_age_check()
         return True
 
 # -------------------- TPU launcher with isolated actor env ------------------
-def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | None,
-                       pip_versions: dict[str, str], disable_age_check: bool):
+def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | None):
     # Parse chip list; default 0..N-1
     if not tpu_chips_csv or tpu_chips_csv.strip() == "":
         chips = [str(i) for i in range(max(1, num_engines))]
@@ -219,17 +251,13 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
     if len(chips) < num_engines:
         raise ValueError(f"Need at least {num_engines} TPU chips, got {len(chips)} from --tpu_chips={tpu_chips_csv!r}")
 
+    # vllm-tpu bundles all required dependencies (jax, jaxlib, libtpu, torch, tpu-inference)
     pip_list = [
-        pip_versions["engine_vllm"],
-        pip_versions["engine_jax"],
-        pip_versions["engine_jaxlib"],
-        pip_versions["engine_libtpu"],          # fresh (Oct 22, 2025) - satisfies Pallas age check
-        pip_versions["engine_torch"],
-        pip_versions["engine_transformers"],
-        pip_versions["engine_numpy"],
+        "vllm-tpu",
+        "transformers>=4.30.0",
+        "numpy>=1.21.0",
         "tensorboard>=2.20.0",
         "psutil>=5.8.0",
-        "virtualenv>=20.0.0",
     ]
 
     engines = []
@@ -242,14 +270,12 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
                 "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
                 "VLLM_DEVICE": "tpu",
                 "HF_HUB_DISABLE_TELEMETRY": "1",
-                # Optional opt-in for risky bypass:
-                "VLLM_TPU_DISABLE_LIBTPU_AGE_CHECK": "1" if disable_age_check else "0",
             },
             "pip": pip_list,
         }
         actor = TpuEngineActor.options(num_cpus=0, scheduling_strategy="DEFAULT",
                                        runtime_env=runtime_env).remote(
-            model_dir=model_dir, dtype="bfloat16", disable_age_check=disable_age_check
+            model_dir=model_dir, dtype="bfloat16", disable_age_check=False
         )
         engines.append(actor)
     return engines
@@ -306,17 +332,8 @@ def main(args):
         task_datas = json.load(f)
     task_datas = task_datas[:200]
 
-    # Launch TPU engines with per-actor pip env (fresh libtpu/JAX/vLLM)
-    pip_versions = {
-        "engine_vllm": args.engine_vllm,
-        "engine_jax": args.engine_jax,
-        "engine_jaxlib": args.engine_jaxlib,
-        "engine_libtpu": args.engine_libtpu,
-        "engine_torch": args.engine_torch,
-        "engine_transformers": args.engine_transformers,
-        "engine_numpy": args.engine_numpy,
-    }
-    engines = launch_tpu_engines(args.num_engines, base_model_path, args.tpu_chips, pip_versions, args.disable_libtpu_age_check)
+    # Launch TPU engines with per-actor pip env (vllm-tpu bundles all dependencies)
+    engines = launch_tpu_engines(args.num_engines, base_model_path, args.tpu_chips)
 
     # ES loop
     for i in range(args.num_iterations):

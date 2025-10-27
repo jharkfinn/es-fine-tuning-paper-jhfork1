@@ -480,3 +480,132 @@ libtpu 0.0.27 → PJRT API size 32 (incompatible with torch_xla 2.8.1)
 **Last Updated:** 2025-10-27
 **Environment:** TPU v6 lite on Cloud TPU
 **Status:** ❌ **BLOCKED** - vLLM 0.11.0 requires torch_xla, which is incompatible with libtpu versions fresh enough for JAX Pallas
+
+---
+
+## vLLM TPU Unified Backend Migration (2025-10-27)
+
+### Background
+
+Following discovery of the official `vllm-tpu` package and unified TPU backend (announced October 16, 2025), we migrated from the torch_xla-based approach to the new JAX-native backend.
+
+### Migration to vllm-tpu
+
+**Package**: `vllm-tpu` (official TPU distribution from vLLM project)
+- Released: October 2025
+- GitHub: https://github.com/vllm-project/tpu-inference
+- Docs: https://docs.vllm.ai/projects/tpu/
+
+**Key Features**:
+- Unified JAX→XLA lowering path (no torch_xla bridge)
+- Pre-integrated tpu-inference plugin
+- Bundles all TPU dependencies (jax, jaxlib, libtpu, torch)
+- Officially recommended for TPU v5e and v6e
+
+### Configuration Changes
+
+**requirements-engine-v2.txt** (simplified):
+```
+vllm-tpu
+transformers>=4.30.0
+numpy>=1.21.0
+tensorboard>=2.20.0
+psutil>=5.8.0
+```
+
+**Runtime environment**:
+```python
+runtime_env = {
+    "env_vars": {
+        "TPU_VISIBLE_CHIPS": chip_id,
+        "PJRT_DEVICE": "TPU",              # Required for unified backend
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_DEVICE": "tpu",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    },
+    "pip": ["vllm-tpu", "transformers>=4.30.0", "numpy>=1.21.0", ...]
+}
+```
+
+### Test Results
+
+**✅ Successful Components**:
+1. vllm-tpu package installation in Ray actor environment
+2. TPU v6e-1 detection and initialization  
+3. JAX 0.7.2 backend initialization
+4. Model loading from HuggingFace
+5. TPU compilation pipeline
+6. No torch_xla dependency errors
+
+**Initialization Log Extract**:
+```
+INFO: Automatically detected platform tpu.
+INFO: TPU info: node_name=None | tpu_type=v6e-1 | worker_id=0 | num_chips=1
+INFO: Using max model len 32768
+INFO: Using ray runtime env (vllm-tpu, transformers>=4.30.0, ...)
+INFO: Resolved architecture: Qwen2ForCausalLM
+INFO: Init worker | rank=0 | node_id=0 | is_driver_worker=True | hbm=[(0.0, 31.25)]GiB
+INFO: Loading model with MODEL_IMPL_TYPE=flax_nnx
+```
+
+### Remaining Challenge: JAX Model Parameter Access
+
+**Issue**: The parameter access API differs between PyTorch and JAX/NNX models.
+
+**PyTorch (old approach)**:
+```python
+model.named_parameters()  # Returns iterator of (name, Parameter) tuples
+```
+
+**JAX NNX (new backend)**:
+```python
+# NNX uses different parameter access patterns
+# Investigation needed for proper weight manipulation
+```
+
+**Error Encountered**:
+```
+AttributeError: 'InprocClient' object has no attribute 'model_executor'
+RuntimeError: Could not locate model parameters in vLLM engine
+```
+
+**Root Cause**: 
+- vllm-tpu uses JAX NNX models (Flax NNX architecture)
+- NNX parameter access differs from PyTorch's `named_parameters()`
+- Current ES weight manipulation code assumes PyTorch API
+
+### Next Steps
+
+1. **Investigate JAX NNX Parameter API**:
+   - Study Flax NNX documentation for parameter access
+   - Identify equivalent to PyTorch's `named_parameters()`
+   - May need to use `nnx.state(model)` or similar
+
+2. **Adapt ES Weight Manipulation**:
+   - Update `_resolve_param_accessor()` for JAX models
+   - Modify `perturb_self_weights()` to work with JAX arrays
+   - Handle JAX parameter update semantics (immutable vs mutable)
+
+3. **Consider Alternative Approaches**:
+   - Check if vllm-tpu exposes weight loading/saving APIs
+   - Investigate if model weights can be saved/loaded between perturbations
+   - May need to reload model with perturbed weights rather than in-place mutation
+
+### References
+
+- vLLM TPU Blog: https://blog.vllm.ai/2025/10/16/vllm-tpu.html
+- TPU Inference GitHub: https://github.com/vllm-project/tpu-inference
+- vLLM TPU Docs: https://docs.vllm.ai/projects/tpu/
+- Flax NNX Docs: https://flax.readthedocs.io/en/latest/nnx/index.html
+
+### Status
+
+**Migration**: ✅ SUCCESSFUL
+**Dependency Deadlock**: ✅ RESOLVED (no torch_xla required)
+**Model Loading**: ✅ WORKING
+**TPU Compilation**: ✅ WORKING
+**ES Weight Manipulation**: ⚠️ NEEDS ADAPTATION for JAX/NNX API
+
+**Script**: `es_fine-tuning_countdown_accl_tpu_vllm_isolated_env_v2.py`
+**Requirements**: `requirements-engine-v2.txt`, `requirements-driver-v2.txt`
+
