@@ -173,6 +173,12 @@ class WorkerExtension:
 
     # --------- ES ops ---------
     def perturb_self_weights(self, seed: int, sigma_or_scale: float, negate: bool = False):
+        # Lazy initialization (since __init__ may not be called when injected)
+        if not hasattr(self, '_state_mode'):
+            self._state_mode = None
+        if not hasattr(self, '_ref_state'):
+            self._ref_state = None
+
         mode, state = self._get_state()
         if self._ref_state is None:
             self._ref_state = state  # cache first seen state for dtype/sharding refs
@@ -211,6 +217,12 @@ class WorkerExtension:
 
     def load_state_dict(self, state_cpu):
         """Load CPU numpy PyTree back into device arrays w/ correct dtype & sharding."""
+        # Lazy initialization (since __init__ may not be called when injected)
+        if not hasattr(self, '_state_mode'):
+            self._state_mode = None
+        if not hasattr(self, '_ref_state'):
+            self._ref_state = None
+
         # Ensure ref tree present for dtype/sharding
         if self._ref_state is None:
             _, ref = self._get_state()
