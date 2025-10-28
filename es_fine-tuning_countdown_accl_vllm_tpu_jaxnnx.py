@@ -70,6 +70,8 @@ class VllmTpuActor:
         self._SamplingParams = SamplingParams
         # Register our JAX/NNX ES worker extension here
         # Note: vllm-tpu doesn't accept 'device' parameter, uses env vars instead
+        # Per expert advice: tune batching params to match per-seed prompt batch (200)
+        # This helps vLLM pipeline prefill vs decode for 10-30% speedup
         self._llm = LLM(
             model=model_dir,
             tensor_parallel_size=1,             # one chip per actor
@@ -78,10 +80,8 @@ class VllmTpuActor:
             dtype=dtype,
             enable_prefix_caching=False,
             enforce_eager=False,
-            # Revert batching params - they caused overhead without benefit
-            # max_num_batched_tokens=8192,        # Allow larger batches (up from 2048 default)
-            # max_num_seqs=64,                    # Allow more concurrent sequences (up from 8 default)
-            # gpu_memory_utilization=0.95,        # Use available HBM headroom (at 90.3% currently)
+            max_num_seqs=200,                   # Match per-seed batch (200 prompts)
+            max_num_batched_tokens=204800,      # 200 prompts × 1024 max_tokens
         )
 
     # Inference

@@ -15,36 +15,45 @@ TPU compute (MXU units) can be underutilized even with high HBM usage because:
 
 ## Optimization Strategies (Ranked by Impact)
 
-### 1. ⭐ Batch Size Optimization (TESTED - NO IMPROVEMENT)
-**Expected improvement**: 2-5x throughput (DID NOT MATERIALIZE)
+### 1. ⭐ Tune vLLM Batching for Prefill/Decode Pipelining (IMPLEMENTED)
+**Expected improvement**: 10-30% per-seed latency reduction
 
-**Current**: Already sending 200 prompts at once per seed
+**Expert advice**: Match vLLM batch params to per-seed prompt count for better prefill/decode overlap
 
-**Tested**: Increased vLLM batch size parameters
-
+**Implementation** (es_fine-tuning_countdown_accl_vllm_tpu_jaxnnx.py:73-85):
 ```python
-# This was TESTED and made things SLOWER (17s → 28s per seed)
 self._llm = LLM(
     model=model_dir,
-    max_num_batched_tokens=8192,   # Up from default 2048
-    max_num_seqs=64,                # Up from default 8
-    gpu_memory_utilization=0.95,   # Use more HBM
-    ...
+    tensor_parallel_size=1,
+    distributed_executor_backend="ray",
+    worker_extension_cls="utils.nnx_es_worker.WorkerExtension",
+    dtype=dtype,
+    enable_prefix_caching=False,
+    enforce_eager=False,
+    max_num_seqs=200,                   # Match per-seed batch (200 prompts)
+    max_num_batched_tokens=204800,      # 200 prompts × 1024 max_tokens
 )
 ```
 
-**Why it FAILED**:
-- ❌ We already batch 200 prompts per seed (good batching WITHIN each seed)
-- ❌ Each seed needs different weight perturbations (can't batch ACROSS seeds)
-- ❌ Larger buffers just added overhead without benefit
-- ❌ The bottleneck is sequential seed evaluation, not per-seed batching
+**Why this helps**:
+- ✅ vLLM pipelines prefill vs decode internally when batch size matches KV budget
+- ✅ Keeps both TPU cores busy during generation
+- ✅ Reduces per-seed wall time through better scheduling
 
-**Conclusion**: The code is already optimally batched. The only way to speed up is:
-1. Use multiple TPU chips with multiple engines (rolling window)
-2. Use a larger model that better saturates TPU compute
-3. Reduce population size (fewer seeds to evaluate)
+**Previous attempt (arbitrary large buffers) FAILED**:
+- Setting max_num_seqs=64 and max_num_batched_tokens=8192 made things SLOWER (17s → 28s)
+- Problem: Params didn't match actual workload, added overhead
+- Solution: Size params to actual per-seed batch (200 prompts)
 
-### 2. ⚠️ Use Multiple TPU Chips (Not Available on Single-Chip TPU)
+### 2. ❌ Multiple vLLM Engines on One Chip (NOT POSSIBLE)
+**Why we can't do this**:
+- ❌ Two processes cannot share one v6e-1 chip (JAX/TPU device exclusivity)
+- ❌ Two vLLM engines inside one process is not a supported configuration
+- ❌ Memory would be tight even if it worked (~27 GiB for 2 engines, only 31.25 GiB available)
+
+**Expert clarification**: "Bottom line: two processes cannot share one v6e-1 chip, and two vLLM engines inside one process isn't a supported configuration either."
+
+### 3. ⚠️ Use Multiple TPU Chips (Not Available on Single-Chip TPU)
 **Expected improvement**: Near-linear scaling (2x with 2 chips, 4x with 4 chips)
 
 **Limitation**: This machine has only 1 TPU chip (TPU v6e-1)
@@ -55,7 +64,7 @@ self._llm = LLM(
 
 **Current bottleneck**: Sequential seed evaluation on single chip
 
-### 3. ⚡ Increase max_tokens (Medium Impact)
+### 4. ⚡ Increase max_tokens (Medium Impact)
 **Expected improvement**: 20-50% throughput
 
 **Current**: `max_tokens=1024`
@@ -71,7 +80,7 @@ actor.generate.remote(prompts, max_tokens=2048, ...)
 - Better amortization of prefill cost
 - Longer sequences = more matmuls
 
-### 4. 📊 Use Larger Model (Medium Impact)
+### 5. 📊 Use Larger Model (Medium Impact)
 **Expected improvement**: 30-80% compute utilization
 
 **Current**: Qwen2.5-3B-Instruct
@@ -91,7 +100,7 @@ python es_fine-tuning_countdown_accl_vllm_tpu_jaxnnx.py \
 
 **Trade-off**: 2-3x slower per-problem latency (but better overall throughput with batching)
 
-### 5. 🔧 Disable Prefix Caching (Low Impact, for testing only)
+### 6. 🔧 Disable Prefix Caching (Low Impact, for testing only)
 **Expected improvement**: Minor, mainly for measurement
 
 ```python
@@ -104,7 +113,7 @@ self._llm = LLM(
 
 Already disabled in your code. Good!
 
-### 6. 🎯 Enable KV Cache Chunked Prefill (Low-Medium Impact)
+### 7. 🎯 Enable KV Cache Chunked Prefill (Low-Medium Impact)
 **Expected improvement**: 10-30% for long sequences
 
 ```python
