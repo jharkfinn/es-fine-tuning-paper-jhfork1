@@ -15,58 +15,45 @@ TPU compute (MXU units) can be underutilized even with high HBM usage because:
 
 ## Optimization Strategies (Ranked by Impact)
 
-### 1. ⭐ Increase Batch Size (Highest Impact)
-**Expected improvement**: 2-5x throughput
+### 1. ⭐ Batch Size Optimization (TESTED - NO IMPROVEMENT)
+**Expected improvement**: 2-5x throughput (DID NOT MATERIALIZE)
 
-**Current**: Processing 200 problems serially (batch_size=1 effectively)
+**Current**: Already sending 200 prompts at once per seed
 
-**Optimized**: Batch multiple problems together
+**Tested**: Increased vLLM batch size parameters
 
 ```python
-# In VllmTpuActor.__init__, increase batching capacity:
+# This was TESTED and made things SLOWER (17s → 28s per seed)
 self._llm = LLM(
     model=model_dir,
     max_num_batched_tokens=8192,   # Up from default 2048
     max_num_seqs=64,                # Up from default 8
-    gpu_memory_utilization=0.95,   # You have HBM headroom
+    gpu_memory_utilization=0.95,   # Use more HBM
     ...
 )
 ```
 
-**Why it helps**:
-- Parallel matrix multiplies across batch dimension
-- Better MXU utilization (batch dims map to tensor cores)
-- Amortizes overhead across multiple sequences
+**Why it FAILED**:
+- ❌ We already batch 200 prompts per seed (good batching WITHIN each seed)
+- ❌ Each seed needs different weight perturbations (can't batch ACROSS seeds)
+- ❌ Larger buffers just added overhead without benefit
+- ❌ The bottleneck is sequential seed evaluation, not per-seed batching
 
-### 2. ⭐ Use All 4 TPU Chips (High Impact)
-**Expected improvement**: Near-linear scaling to 4x throughput
+**Conclusion**: The code is already optimally batched. The only way to speed up is:
+1. Use multiple TPU chips with multiple engines (rolling window)
+2. Use a larger model that better saturates TPU compute
+3. Reduce population size (fewer seeds to evaluate)
 
-**Current**: 1 chip (`--tpu_chips 0`)
+### 2. ⚠️ Use Multiple TPU Chips (Not Available on Single-Chip TPU)
+**Expected improvement**: Near-linear scaling (2x with 2 chips, 4x with 4 chips)
 
-**Optimized**: Tensor parallelism across 4 chips
+**Limitation**: This machine has only 1 TPU chip (TPU v6e-1)
 
-```python
-# Modify VllmTpuActor.__init__:
-self._llm = LLM(
-    model=model_dir,
-    tensor_parallel_size=4,  # Spread model across 4 chips
-    ...
-)
+**If you had multiple chips**, you could:
+1. Use tensor parallelism to spread model across chips (higher memory bandwidth)
+2. Use multiple engines (one per chip) for parallel seed evaluation (rolling window)
 
-# In launch script:
-export TPU_VISIBLE_CHIPS=0,1,2,3
-python es_fine-tuning_countdown_accl_vllm_tpu_jaxnnx.py \
-  --num_engines 1 \
-  --tpu_chips "0,1,2,3" \
-  ...
-```
-
-**Why it helps**:
-- 4x memory bandwidth (4 HBMs)
-- 4x compute (4 MXUs working in parallel)
-- Model sharding reduces per-chip memory pressure
-
-**Trade-off**: Adds communication overhead between chips (usually <10% for this size)
+**Current bottleneck**: Sequential seed evaluation on single chip
 
 ### 3. ⚡ Increase max_tokens (Medium Impact)
 **Expected improvement**: 20-50% throughput
