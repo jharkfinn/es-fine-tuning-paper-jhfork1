@@ -82,8 +82,8 @@ class VllmTpuActor:
             enforce_eager=False,
             kv_cache_dtype="fp8_e5m2",          # FP8 KV cache for 2x memory savings
             max_model_len=512,                  # Countdown outputs are short (~100-300 tokens)
-            max_num_seqs=512,                   # 2x increase: 256 → 512 (~20% KV cache capacity)
-            max_num_batched_tokens=65536,       # 2x increase: 512 prompts × ~128 avg tokens
+            max_num_seqs=1000,                  # Moderate concurrency (2000 causes fragmentation OOM)
+            max_num_batched_tokens=65536,       # Cap total tokens to avoid compile OOM (131k fails)
         )
 
     # Inference
