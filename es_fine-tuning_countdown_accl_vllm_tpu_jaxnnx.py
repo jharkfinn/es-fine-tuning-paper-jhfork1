@@ -70,8 +70,8 @@ class VllmTpuActor:
         self._SamplingParams = SamplingParams
         # Register our JAX/NNX ES worker extension here
         # Note: vllm-tpu doesn't accept 'device' parameter, uses env vars instead
-        # Per expert advice: tune batching params to match per-seed prompt batch (200)
-        # This helps vLLM pipeline prefill vs decode for 10-30% speedup
+        # FP8 KV cache for memory efficiency and potential throughput improvement
+        # Increased batching with FP8 KV cache: 500 prompts per seed
         self._llm = LLM(
             model=model_dir,
             tensor_parallel_size=1,             # one chip per actor
@@ -80,8 +80,9 @@ class VllmTpuActor:
             dtype=dtype,
             enable_prefix_caching=False,
             enforce_eager=False,
-            max_num_seqs=200,                   # Match per-seed batch (200 prompts)
-            max_num_batched_tokens=204800,      # 200 prompts × 1024 max_tokens
+            kv_cache_dtype="fp8_e5m2",          # FP8 KV cache for 2x memory savings
+            max_num_seqs=500,                   # Increased from 200 to 500 (2.5x)
+            max_num_batched_tokens=81920,       # 500 prompts × ~100 input tokens (scaled from 32768)
         )
 
     # Inference
@@ -158,9 +159,42 @@ def launch_tpu_engines(num_engines: int, model_dir: str, tpu_chips_csv: str | No
         engines.append(actor)
     return engines
 
-def evaluate_countdown_handle(actor, task_datas):
+def pad_prompts_to_length(prompts, tokenizer, target_length=1000):
+    """Pad each prompt to target_length tokens by adding repeated padding text."""
+    padded_prompts = []
+    # Use a simple padding string that doesn't affect the task semantics
+    padding_text = " Here are some additional details and context for this problem: " * 50
+
+    for prompt in prompts:
+        # Tokenize to check current length
+        tokens = tokenizer.encode(prompt)
+        current_length = len(tokens)
+
+        if current_length >= target_length:
+            # Already long enough
+            padded_prompts.append(prompt)
+        else:
+            # Add padding until we reach target length
+            padded_prompt = prompt
+            while len(tokenizer.encode(padded_prompt)) < target_length:
+                padded_prompt = padded_prompt + padding_text
+            # Trim to exact target if we overshot
+            tokens = tokenizer.encode(padded_prompt)
+            if len(tokens) > target_length:
+                tokens = tokens[:target_length]
+                padded_prompt = tokenizer.decode(tokens)
+            padded_prompts.append(padded_prompt)
+
+    return padded_prompts
+
+def evaluate_countdown_handle(actor, task_datas, tokenizer=None, pad_to_length=None, max_tokens=1024):
     prompts = [d["context"] for d in task_datas]
-    return actor.generate.remote(prompts, temperature=0.0, seed=42, max_tokens=1024), time.time()
+
+    # Pad prompts if requested
+    if pad_to_length is not None and tokenizer is not None:
+        prompts = pad_prompts_to_length(prompts, tokenizer, pad_to_length)
+
+    return actor.generate.remote(prompts, temperature=0.0, seed=42, max_tokens=max_tokens), time.time()
 
 def _postprocess_outputs(outputs, task_datas, reward_fn):
     rewards, avg_rewards = [], []
@@ -223,7 +257,7 @@ def main(args):
     data_path = "countdown/data/countdown.json"
     with open(data_path, "r") as f:
         task_datas = json.load(f)
-    task_datas = task_datas[:200]
+    task_datas = task_datas[:500]  # Increased from 200 to 500 prompts per seed
 
     # Launch TPU engines
     pip_versions = {
