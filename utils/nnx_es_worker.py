@@ -27,6 +27,10 @@ import os
 from typing import Any, Tuple
 
 import numpy as np
+try:  # Prefer cloudpickle for PyTreeDef serialization (falls back to stdlib)
+    import cloudpickle as _pickle  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    import pickle as _pickle
 
 try:
     import jax
@@ -291,7 +295,7 @@ class WorkerExtension:
         leaves, treedef = jax.tree_util.tree_flatten(state_cpu)
         np.savez_compressed(path_prefix + ".npz", *leaves)
         with open(path_prefix + ".treedef", "wb") as f:
-            f.write(treedef.to_pickle())  # type: ignore[attr-defined]
+            _pickle.dump(treedef, f)
         return True
 
     def get_tpu_stats(self):

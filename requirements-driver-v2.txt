@@ -1,7 +1,8 @@
 # Driver/orchestrator environment (NO torch_xla, NO JAX, NO vLLM)
+--extra-index-url https://download.pytorch.org/whl/cpu
 ray>=2.50.0
 transformers>=4.30.0
-torch==2.8.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu  # CPU-only, no CUDA
+torch==2.8.0+cpu        # CPU-only build from the official PyTorch CPU wheels
 tensorboard>=2.20.0
 numpy>=1.21.0
 pandas>=2.3.0

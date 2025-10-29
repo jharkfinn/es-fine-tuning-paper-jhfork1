@@ -83,7 +83,6 @@ On preliminary 4xH100 setting, accelerated version achieves ~10 times speed-up w
 - `--precision`: Model precision, default to be `bf16`
 - `--verbose`: Enable detailed logging if this argument is present in the command line
 
-
 ## Citation
 
 If you find this work helpful in your research, please cite:

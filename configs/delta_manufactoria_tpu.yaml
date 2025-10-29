@@ -1,0 +1,49 @@
+task:
+  name: delta/manufactoria
+  dataset_repo: manufactoria/basic_mix_train
+  split: train
+  score_mode: pass_rate
+  max_cases: 40
+  max_runtime_seconds: 5.0
+  warmup_generations: 100
+  phase2_score_mode: full_pass
+
+dataset:
+  train:
+    repo: manufactoria/basic_mix_train
+    split: train
+  eval:
+    repo: manufactoria/basic_mix_test
+    split: test
+
+model:
+  name: Qwen/Qwen2.5-3B-Instruct
+  dtype: bfloat16
+  max_new_tokens: 1024
+
+engine:
+  num_engines: 1
+  tpu_chips: null
+  dtype: bfloat16
+  sampling_defaults:
+    temperature: 0.0
+    seed: 42
+    max_tokens: 1024
+  pip_requirements:
+    - vllm-tpu
+    - transformers>=4.30.0
+    - numpy>=1.21.0
+    - psutil>=5.8.0
+    - tensorboard>=2.20.0
+    - virtualenv>=20.0.0
+
+es:
+  sigma: 0.001
+  alpha: 0.0005
+  population_size: 30
+  num_iterations: 1000
+  global_seed: null
+
+logging:
+  experiment_dir: es-ft-experiments
+  tensorboard: true

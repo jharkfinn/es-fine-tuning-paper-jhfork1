@@ -71,7 +71,7 @@ class VllmTpuActor:
         # Register our JAX/NNX ES worker extension here
         # Note: vllm-tpu doesn't accept 'device' parameter, uses env vars instead
         # FP8 KV cache for memory efficiency and potential throughput improvement
-        # Increased batching with FP8 KV cache: 500 prompts per seed
+        # Increased batching with FP8 KV cache: 100 prompts per seed
         self._llm = LLM(
             model=model_dir,
             tensor_parallel_size=1,             # one chip per actor
@@ -82,8 +82,8 @@ class VllmTpuActor:
             enforce_eager=False,
             kv_cache_dtype="fp8_e5m2",          # FP8 KV cache for 2x memory savings
             max_model_len=512,                  # Countdown outputs are short (~100-300 tokens)
-            max_num_seqs=1000,                  # Moderate concurrency (2000 causes fragmentation OOM)
-            max_num_batched_tokens=65536,       # Cap total tokens to avoid compile OOM (131k fails)
+            max_num_seqs=100,                   # Reduced from 1000 to 100 to shrink batch size
+            max_num_batched_tokens=32768,       # 100 prompts × ~320 input tokens (scaled from 32768)
         )
 
     # Inference
@@ -258,7 +258,7 @@ def main(args):
     data_path = "countdown/data/countdown.json"
     with open(data_path, "r") as f:
         task_datas = json.load(f)
-    task_datas = task_datas[:500]  # Increased from 200 to 500 prompts per seed
+    task_datas = task_datas[:100]  # Increased from 200 to 100 prompts per seed
 
     # Launch TPU engines
     pip_versions = {
